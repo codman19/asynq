@@ -188,7 +188,8 @@ func (p *processor) exec() {
 		return
 	case p.sema <- struct{}{}: // acquire token
 		qnames := p.queues()
-		if !p.allowDequeue(qnames) {
+		qnames = p.filterQueues(qnames)
+		if len(qnames) == 0 {
 			// Conditions are not met; skip fetching tasks this round.
 			// Wait before the next attempt to avoid slamming redis.
 			p.waitBeforeNextAttempt()
@@ -280,21 +281,33 @@ func (p *processor) exec() {
 	}
 }
 
-// allowDequeue reports whether the processor should fetch tasks from the
-// given queues. It calls the user-provided PreDequeueFunc if configured,
-// and recovers from a panic in the function, treating it as an indication
-// to skip fetching tasks.
-func (p *processor) allowDequeue(qnames []string) (ok bool) {
+// filterQueues applies the user-provided PreDequeueFunc if configured, and
+// returns the list of queues to fetch tasks from in the current attempt.
+// Queue names that are not present in qnames are dropped, and duplicate
+// names are deduped. A nil return value indicates that fetching should be
+// skipped this attempt. It recovers from a panic in the function, treating
+// it as an indication to skip fetching tasks.
+func (p *processor) filterQueues(qnames []string) (queues []string) {
 	if p.preDequeueFunc == nil {
-		return true
+		return qnames
 	}
 	defer func() {
 		if x := recover(); x != nil {
 			p.logger.Errorf("recovering from panic in PreDequeueFunc. See the stack trace below for details:\n%s", string(debug.Stack()))
-			ok = false
+			queues = nil
 		}
 	}()
-	return p.preDequeueFunc(p.preDequeueCtx, qnames)
+	allowed := make(map[string]struct{}, len(qnames))
+	for _, q := range qnames {
+		allowed[q] = struct{}{}
+	}
+	for _, q := range p.preDequeueFunc(p.preDequeueCtx, qnames) {
+		if _, ok := allowed[q]; ok {
+			queues = append(queues, q)
+			delete(allowed, q) // dedupe
+		}
+	}
+	return queues
 }
 
 // waitBeforeNextAttempt waits for a semi-random duration of

@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Add `PreDequeueFunc` config to skip fetching tasks based on custom conditions before dequeue; tasks are left in the pending state untouched (design doc: `docs/pre-dequeue-func-design.md`)
+- Add `PreDequeueFunc` config for per-queue pre-checks before dequeue: the function returns the list of queues to fetch from in the current attempt (a subset of the configured queues); an empty return skips fetching entirely and tasks are left in the pending state untouched (design doc: `docs/pre-dequeue-func-design.md`)
 
 ## [0.26.0] - 2026-02-03
 

@@ -2,7 +2,7 @@
 
 > Status: Confirmed, implemented
 > Date: 2026-09-03
-> Chinese version: [pre-dequeue-func-design-cn.md](pre-dequeue-func-design-cn.md)
+> Revision: 2026-09-03 — signature changed from returning `bool` to returning the list of queues to fetch from, enabling per-queue control (§3.2).
 
 ## 1. Background and Goals
 
@@ -42,7 +42,7 @@ Add a new field to `Config`, styled after `RetryDelayFunc` / `IsFailure` (type n
 ```go
 // PreDequeueFunc is called before the server attempts to fetch tasks
 // from the given queues.
-type PreDequeueFunc func(ctx context.Context, queues []string) bool
+type PreDequeueFunc func(ctx context.Context, queues []string) []string
 ```
 
 ```go
@@ -50,21 +50,29 @@ type Config struct {
     // ...existing fields...
 
     // PreDequeueFunc optionally specifies a function that is called before
-    // each fetch attempt. If the function returns false, the server skips
-    // fetching tasks; tasks remain in the pending state untouched, and the
-    // server retries after TaskCheckInterval.
+    // each fetch attempt. It returns the list of queues to fetch tasks from
+    // in the current attempt. If the function returns an empty list, the
+    // server skips fetching; tasks remain in the pending state untouched,
+    // and the server retries after TaskCheckInterval.
     PreDequeueFunc PreDequeueFunc
 }
 ```
 
 ### 3.2 Semantic contract
 
-- **`queues` argument**: the list of queue names about to be queried this round (priority-randomized or strict order); supports "check only a specific queue" usage;
+- **`queues` argument**: the list of queue names about to be queried this round (priority-randomized or strict order);
 - **`ctx` argument**: a shutdown-aware context. **It is canceled when the server stops pulling tasks** (`Stop()` / `Shutdown()`), used to unblock waits inside the hook;
-- **returns `true`**: proceed with fetching this round;
-- **returns `false`**: skip fetching this round; tasks stay in the pending state untouched (not moved to active, no lease, no failure record, no `retried` change); re-checked after backoff;
-- **unset**: behavior is exactly the same as before (the overhead of a single nil check);
-- **panic**: the framework recovers, treats it as returning `false` and logs an error (aligned with how `perform` handles panics in user code); a panic must not take down the processor goroutine.
+- **return value** = the list of queues to query this round:
+  - return the input unchanged (or a subset of it) → fetch only from those queues, in the **returned order**. Returning a single name realizes "fetch from one queue this round"; returning a subset realizes "queue A's downstream is not ready, but queue B may be fetched";
+  - return `nil` / empty → skip fetching this round; tasks stay in the pending state untouched (not moved to active, no lease, no failure record, no `retried` change); re-checked after backoff;
+  - **names not present in the `queues` argument are dropped** (the hook can only narrow, never widen — a returned queue the server is not configured to serve must not be fetched);
+  - **duplicate names are deduped**;
+- **unset**: behavior is exactly the same as before (the overhead of a single nil check; zero allocation);
+- **panic**: the framework recovers, treats it as returning an empty list and logs an error (aligned with how `perform` handles panics in user code); a panic must not take down the processor goroutine.
+
+Why return a queue list rather than `bool`: the single `bool` can only express "fetch / don't fetch from **all** queues this round". With the list, per-queue pre-checks become possible — the hook decides which queues' conditions are met. Returning `queues` as-is is exactly equivalent to the old `return true`; returning `nil` is exactly equivalent to the old `return false`; so the old semantics remain expressible as special cases.
+
+Note on efficiency: returning a subset (even a single queue) still keeps the atomic multi-queue `Dequeue` path — the filtered list is passed to the same Lua script in one round trip. This is deliberately different from "make `processor.queues()` itself return one name": a lone random pick that lands on an empty queue would trigger the empty-queue sleep even when other (allowed) queues have pending tasks, hurting throughput.
 
 ### 3.3 Blocking behavior contract
 
@@ -74,14 +82,14 @@ The hook runs on the single processor goroutine; **bounded blocking** is allowed
 - every blocking path must have an exit. Recommended pattern:
 
 ```go
-PreDequeueFunc: func(ctx context.Context, queues []string) bool {
+PreDequeueFunc: func(ctx context.Context, queues []string) []string {
     select {
     case <-depsReady:                    // condition met, allow immediately (faster reaction than fixed backoff)
-        return true
+        return queues
     case <-time.After(2 * time.Second):  // upper bound of the bounded wait
-        return false
+        return nil
     case <-ctx.Done():                   // exit immediately when the server stops
-        return false
+        return nil
     }
 }
 ```
@@ -111,11 +119,12 @@ preDequeueCancel context.CancelFunc
 
 2. Create them in `newProcessor`: `ctx, cancel := context.WithCancel(context.Background())`;
 3. Call `preDequeueCancel()` in `stop()` before sending on `done`;
-4. Insert the check in `exec()` before `Dequeue`:
+4. Insert the filter in `exec()` before `Dequeue`:
 
 ```go
 qnames := p.queues()
-if !p.allowDequeue(qnames) {
+qnames = p.filterQueues(qnames)
+if len(qnames) == 0 {
     // Conditions are not met; skip fetching tasks this round.
     // Wait before the next attempt to avoid slamming redis.
     p.waitBeforeNextAttempt()
@@ -125,20 +134,35 @@ if !p.allowDequeue(qnames) {
 msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
 ```
 
-5. The `allowDequeue` wrapper (nil short-circuit + panic recovery):
+5. The `filterQueues` wrapper (nil short-circuit + validation + panic recovery):
 
 ```go
-func (p *processor) allowDequeue(qnames []string) (ok bool) {
+// filterQueues applies the user-configured PreDequeueFunc to the given
+// queue names and returns the list of queues to fetch tasks from in the
+// current attempt. Queue names not present in qnames are dropped, and
+// duplicate names are deduped. A nil return value skips the current
+// fetch attempt.
+func (p *processor) filterQueues(qnames []string) (queues []string) {
     if p.preDequeueFunc == nil {
-        return true
+        return qnames
     }
     defer func() {
         if x := recover(); x != nil {
             p.logger.Errorf("Panic in PreDequeueFunc, skipping fetch: %v ...", x)
-            ok = false
+            queues = nil
         }
     }()
-    return p.preDequeueFunc(p.preDequeueCtx, qnames)
+    allowed := make(map[string]struct{}, len(qnames))
+    for _, q := range qnames {
+        allowed[q] = struct{}{}
+    }
+    for _, q := range p.preDequeueFunc(p.preDequeueCtx, qnames) {
+        if _, ok := allowed[q]; ok {
+            queues = append(queues, q)
+            delete(allowed, q) // dedupe
+        }
+    }
+    return queues
 }
 ```
 
@@ -148,11 +172,15 @@ func (p *processor) allowDequeue(qnames []string) (ok bool) {
 
 | Decision point | Conclusion | Rationale |
 |---|---|---|
-| Signature | `(ctx, queues) bool` | Keep the API minimal; deny-reason logging is done by the user's closure (consistent with `IsFailure`) |
-| Backoff after deny | Reuse `TaskCheckInterval` + jitter | Consistent with the empty-queue path; avoids hot-looping Redis |
-| Token during deny | Released after the sleep (aligned with the empty-queue path) | Behavioral consistency |
+| Signature | `(ctx, queues) []string` — returns the queues to fetch from | `bool` can only gate all queues at once; the list enables per-queue pre-checks while remaining backward-expressive (`queues` ≡ old `true`, `nil` ≡ old `false`) |
+| Unknown names in return value | Dropped (intersection with the input `queues`) | The hook may only narrow: a queue the server is not configured to serve must not be fetched by it |
+| Order of the returned list | The returned order is used as-is (after dropping/dedup) | Predictable contract; a hook that iterates the input naturally preserves the priority order |
+| Duplicates in return value | Deduped | One queue must not be checked twice in a single atomic Dequeue |
+| Backoff after empty result | Reuse `TaskCheckInterval` + jitter | Consistent with the empty-queue path; avoids hot-looping Redis |
+| Token during empty result | Released after the sleep (aligned with the empty-queue path) | Behavioral consistency |
 | Hook ctx | Derived from `context.Background()`, canceled in `stop()` | `BaseContext` has no shutdown semantics and cannot be reused; the cancel guarantees a blocking hook can exit during shutdown |
-| Panic handling | recover + treat as deny + error log | Aligned with `perform`; the processor goroutine must not be taken down by user code |
+| Panic handling | recover + treat as empty result + error log | Aligned with `perform`; the processor goroutine must not be taken down by user code |
+| Alternative: make `processor.queues()` return one name per call | Rejected | A lone random pick landing on an empty queue sleeps even when other queues have tasks; the subset return keeps the atomic multi-queue Dequeue (one round trip) |
 | Alternative: injectable custom Broker | Rejected | Would require exposing `internal/base.Broker`, breaking the internal boundary; large change surface |
 
 ## 6. Test Plan
@@ -162,32 +190,44 @@ Reuse the existing infrastructure in `processor_test.go` (real Redis db14, `h.Se
 | # | Case | Assertion |
 |---|---|---|
 | 1 | Hook unset | All existing tests pass without regression |
-| 2 | Hook always `true` | Tasks processed as usual; active drained |
-| 3 | Hook always `false` | Handler never called; tasks still in pending; active empty |
-| 4 | deny→allow transition | Task eventually processed; hook call count reaches the threshold (polling recovers) |
+| 2 | Hook returns `queues` unchanged | Tasks processed as usual; active drained |
+| 3 | Hook returns `nil` | Handler never called; tasks still in pending; active empty |
+| 4 | skip→allow transition | Task eventually processed; hook call count reaches the threshold (polling recovers) |
 | 5 | `queues` argument (non-strict, multi-queue) | Every sample contains all configured queues (set equality, order random) |
 | 6 | `queues` argument (`StrictPriority`) | Every sample strictly equals the priority-descending order |
 | 7 | Hook panics | Processor does not crash; task not fetched during panicking rounds; processed normally after recovery |
 | 8 | Hook blocks until `ctx.Done()` + shutdown | `shutdown()` returns within the deadline (verifies `preDequeueCancel` works; no hang) |
 | 9 | Server-level wiring | `NewServer` + `Config.PreDequeueFunc` → `srv.processor.preDequeueFunc` is non-nil |
+| 10 | `filterQueues` unit test | nil-func passthrough; subset in returned order; unknown names dropped; duplicates deduped; panic → `nil` |
+| 11 | Subset selection (integration, two queues) | Hook keeps returning only `"default"` → all `default` tasks processed, `critical` tasks still pending, active empty |
 
 ## 7. Usage Example
 
 ```go
 srv := asynq.NewServer(redisOpt, asynq.Config{
     Concurrency: 10,
-    PreDequeueFunc: func(ctx context.Context, queues []string) bool {
-        // Example: do not fetch any tasks while downstream dependencies are not ready
-        if !deps.Ready() {
-            return false
-        }
-        // Example: check the disk watermark only for the "crawl" queue
+    Queues: map[string]int{
+        "critical": 6,
+        "default":  3,
+        "crawl":    1,
+    },
+    PreDequeueFunc: func(ctx context.Context, queues []string) []string {
+        var allowed []string
         for _, q := range queues {
-            if q == "crawl" && disk.Usage() > 0.9 {
-                return false
+            switch q {
+            case "crawl":
+                // Example: fetch from "crawl" only while the disk has headroom.
+                if disk.Usage() < 0.9 {
+                    allowed = append(allowed, q)
+                }
+            default:
+                // Example: gate every other queue on downstream readiness.
+                if deps.Ready() {
+                    allowed = append(allowed, q)
+                }
             }
         }
-        return true
+        return allowed // possibly nil — this round is skipped entirely
     },
 })
 ```

@@ -130,17 +130,24 @@ type Config struct {
 	IsFailure func(error) bool
 
 	// PreDequeueFunc optionally specifies a function that is called before
-	// each fetch attempt. If the function returns false, the server skips
-	// fetching tasks; tasks remain in the pending state untouched and the
-	// server retries after TaskCheckInterval.
+	// each fetch attempt. It returns the list of queues to fetch tasks from
+	// in the current attempt. If the function returns an empty list, the
+	// server skips fetching; tasks remain in the pending state untouched and
+	// the server retries after TaskCheckInterval.
 	//
 	// If unset, the server fetches tasks unconditionally.
 	//
 	// Example:
 	//
-	//     PreDequeueFunc: func(ctx context.Context, queues []string) bool {
-	//         // Skip fetching tasks when the system resource is running low.
-	//         return sysResourceAvailable()
+	//     PreDequeueFunc: func(ctx context.Context, queues []string) []string {
+	//         var allowed []string
+	//         for _, q := range queues {
+	//             // Skip fetching from a queue when its conditions are not met.
+	//             if ready(q) {
+	//                 allowed = append(allowed, q)
+	//             }
+	//         }
+	//         return allowed // possibly nil — skip fetching this time
 	//     }
 	PreDequeueFunc PreDequeueFunc
 
@@ -319,18 +326,21 @@ type RetryDelayFunc func(n int, e error, t *Task) time.Duration
 // off queues (e.g. during shutdown), which can be used to unblock a
 // long-running function.
 //
-// Return false to indicate that the conditions are not met and the server
-// should not fetch tasks this time; tasks are left in the pending state
-// untouched and the server retries after TaskCheckInterval.
-// Return true to proceed with fetching tasks.
+// The function returns the list of queues to fetch tasks from in the current
+// attempt, queried in the returned order. Return queues unchanged (or a
+// subset of it) to fetch only from those queues; queue names that are not
+// present in queues are ignored. Return nil (or an empty slice) to indicate
+// that the conditions are not met and the server should not fetch tasks this
+// time; tasks are left in the pending state untouched and the server retries
+// after TaskCheckInterval.
 //
 // The function runs on the processor's goroutine; while it is running, no
 // tasks are fetched from any of the server's queues. A blocking function
 // must be bounded (e.g. select on a channel, time.After, or ctx.Done) to
 // avoid delaying server shutdown indefinitely.
 // If the function panics, the server recovers and treats it as if it
-// returned false.
-type PreDequeueFunc func(ctx context.Context, queues []string) bool
+// returned nil.
+type PreDequeueFunc func(ctx context.Context, queues []string) []string
 
 // Logger supports logging at various log levels.
 type Logger interface {

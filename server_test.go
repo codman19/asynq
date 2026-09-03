@@ -90,9 +90,9 @@ func TestServerPreDequeueFuncWiring(t *testing.T) {
 	srv := NewServer(getRedisConnOpt(t), Config{
 		Concurrency: 6,
 		LogLevel:    testLogLevel,
-		PreDequeueFunc: func(ctx context.Context, queues []string) bool {
+		PreDequeueFunc: func(ctx context.Context, queues []string) []string {
 			calls.Add(1)
-			return true
+			return queues
 		},
 	})
 	if srv.processor.preDequeueFunc == nil {
