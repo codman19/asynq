@@ -7,6 +7,7 @@ package asynq
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -80,13 +81,45 @@ func TestServerFromRedisClient(t *testing.T) {
 	}
 }
 
+func TestServerPreDequeueFuncWiring(t *testing.T) {
+	// https://github.com/go-redis/redis/issues/1029
+	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
+	defer goleak.VerifyNone(t, ignoreOpt)
+
+	var calls atomic.Int32
+	srv := NewServer(getRedisConnOpt(t), Config{
+		Concurrency: 6,
+		LogLevel:    testLogLevel,
+		PreDequeueFunc: func(ctx context.Context, queues []string) bool {
+			calls.Add(1)
+			return true
+		},
+	})
+	if srv.processor.preDequeueFunc == nil {
+		t.Fatal("Config.PreDequeueFunc was not passed to the processor")
+	}
+
+	if err := srv.Start(HandlerFunc(func(ctx context.Context, task *Task) error { return nil })); err != nil {
+		t.Fatal(err)
+	}
+	// The processor attempts to fetch tasks as soon as it starts;
+	// PreDequeueFunc should be invoked shortly.
+	deadline := time.Now().Add(3 * time.Second)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	srv.Shutdown()
+	if calls.Load() == 0 {
+		t.Error("PreDequeueFunc was not called after the server started")
+	}
+}
+
 func TestServerRun(t *testing.T) {
 	// https://github.com/go-redis/redis/issues/1029
 	ignoreOpt := goleak.IgnoreTopFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).reaper")
 	defer goleak.VerifyNone(t, ignoreOpt)
 
 	srv := NewServer(getRedisConnOpt(t), Config{LogLevel: testLogLevel})
-
 	done := make(chan struct{})
 	// Make sure server exits when receiving TERM signal.
 	go func() {

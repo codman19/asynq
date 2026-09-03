@@ -129,6 +129,21 @@ type Config struct {
 	// By default, if the given error is non-nil the function returns true.
 	IsFailure func(error) bool
 
+	// PreDequeueFunc optionally specifies a function that is called before
+	// each fetch attempt. If the function returns false, the server skips
+	// fetching tasks; tasks remain in the pending state untouched and the
+	// server retries after TaskCheckInterval.
+	//
+	// If unset, the server fetches tasks unconditionally.
+	//
+	// Example:
+	//
+	//     PreDequeueFunc: func(ctx context.Context, queues []string) bool {
+	//         // Skip fetching tasks when the system resource is running low.
+	//         return sysResourceAvailable()
+	//     }
+	PreDequeueFunc PreDequeueFunc
+
 	// List of queues to process with given priority value. Keys are the names of the
 	// queues and values are associated priority value.
 	//
@@ -295,6 +310,27 @@ func (fn ErrorHandlerFunc) HandleError(ctx context.Context, task *Task, err erro
 // e is the error returned by the task handler.
 // t is the task in question.
 type RetryDelayFunc func(n int, e error, t *Task) time.Duration
+
+// PreDequeueFunc is called before the server attempts to fetch tasks
+// from the given queues.
+//
+// queues is the list of queue names that the server is about to query in the
+// current fetch attempt. ctx is canceled when the server stops pulling tasks
+// off queues (e.g. during shutdown), which can be used to unblock a
+// long-running function.
+//
+// Return false to indicate that the conditions are not met and the server
+// should not fetch tasks this time; tasks are left in the pending state
+// untouched and the server retries after TaskCheckInterval.
+// Return true to proceed with fetching tasks.
+//
+// The function runs on the processor's goroutine; while it is running, no
+// tasks are fetched from any of the server's queues. A blocking function
+// must be bounded (e.g. select on a channel, time.After, or ctx.Done) to
+// avoid delaying server shutdown indefinitely.
+// If the function panics, the server recovers and treats it as if it
+// returned false.
+type PreDequeueFunc func(ctx context.Context, queues []string) bool
 
 // Logger supports logging at various log levels.
 type Logger interface {
@@ -548,6 +584,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		taskCheckInterval: taskCheckInterval,
 		baseCtxFn:         baseCtxFn,
 		isFailureFunc:     isFailureFunc,
+		preDequeueFunc:    cfg.PreDequeueFunc,
 		syncCh:            syncCh,
 		cancelations:      cancels,
 		concurrency:       n,

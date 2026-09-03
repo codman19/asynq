@@ -40,6 +40,13 @@ type processor struct {
 	taskCheckInterval time.Duration
 	retryDelayFunc    RetryDelayFunc
 	isFailureFunc     func(error) bool
+	preDequeueFunc    PreDequeueFunc
+
+	// preDequeueCtx is passed to preDequeueFunc and canceled when the
+	// processor stops so that a blocking preDequeueFunc can return promptly
+	// during shutdown.
+	preDequeueCtx    context.Context
+	preDequeueCancel context.CancelFunc
 
 	errHandler      ErrorHandler
 	shutdownTimeout time.Duration
@@ -79,6 +86,7 @@ type processorParams struct {
 	retryDelayFunc    RetryDelayFunc
 	taskCheckInterval time.Duration
 	isFailureFunc     func(error) bool
+	preDequeueFunc    PreDequeueFunc
 	syncCh            chan<- *syncRequest
 	cancelations      *base.Cancelations
 	concurrency       int
@@ -97,6 +105,7 @@ func newProcessor(params processorParams) *processor {
 	if params.strictPriority {
 		orderedQueues = sortByPriority(queues)
 	}
+	preDequeueCtx, preDequeueCancel := context.WithCancel(context.Background())
 	return &processor{
 		logger:            params.logger,
 		broker:            params.broker,
@@ -107,6 +116,9 @@ func newProcessor(params processorParams) *processor {
 		taskCheckInterval: params.taskCheckInterval,
 		retryDelayFunc:    params.retryDelayFunc,
 		isFailureFunc:     params.isFailureFunc,
+		preDequeueFunc:    params.preDequeueFunc,
+		preDequeueCtx:     preDequeueCtx,
+		preDequeueCancel:  preDequeueCancel,
 		syncRequestCh:     params.syncCh,
 		cancelations:      params.cancelations,
 		errLogLimiter:     rate.NewLimiter(rate.Every(3*time.Second), 1),
@@ -127,6 +139,9 @@ func newProcessor(params processorParams) *processor {
 func (p *processor) stop() {
 	p.once.Do(func() {
 		p.logger.Debug("Processor shutting down...")
+		// Unblock preDequeueFunc if it is blocking, and wake up the
+		// processor if it is waiting between fetch attempts.
+		p.preDequeueCancel()
 		// Unblock if processor is waiting for sema token.
 		close(p.quit)
 		// Signal the processor goroutine to stop processing tasks
@@ -173,6 +188,13 @@ func (p *processor) exec() {
 		return
 	case p.sema <- struct{}{}: // acquire token
 		qnames := p.queues()
+		if !p.allowDequeue(qnames) {
+			// Conditions are not met; skip fetching tasks this round.
+			// Wait before the next attempt to avoid slamming redis.
+			p.waitBeforeNextAttempt()
+			<-p.sema // release token
+			return
+		}
 		msg, leaseExpirationTime, err := p.broker.Dequeue(qnames...)
 		switch {
 		case errors.Is(err, errors.ErrNoProcessableTask):
@@ -255,6 +277,37 @@ func (p *processor) exec() {
 				p.handleSucceededMessage(lease, msg)
 			}
 		}()
+	}
+}
+
+// allowDequeue reports whether the processor should fetch tasks from the
+// given queues. It calls the user-provided PreDequeueFunc if configured,
+// and recovers from a panic in the function, treating it as an indication
+// to skip fetching tasks.
+func (p *processor) allowDequeue(qnames []string) (ok bool) {
+	if p.preDequeueFunc == nil {
+		return true
+	}
+	defer func() {
+		if x := recover(); x != nil {
+			p.logger.Errorf("recovering from panic in PreDequeueFunc. See the stack trace below for details:\n%s", string(debug.Stack()))
+			ok = false
+		}
+	}()
+	return p.preDequeueFunc(p.preDequeueCtx, qnames)
+}
+
+// waitBeforeNextAttempt waits for a semi-random duration of
+// [taskCheckInterval/2, 1.5*taskCheckInterval) before the next fetch attempt,
+// similar to the behavior when all queues are empty.
+// It returns early when the processor is shutting down.
+func (p *processor) waitBeforeNextAttempt() {
+	jitter := rand.N(p.taskCheckInterval)
+	timer := time.NewTimer(p.taskCheckInterval/2 + jitter)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-p.preDequeueCtx.Done():
 	}
 }
 

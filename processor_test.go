@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -992,5 +993,262 @@ func TestReturnPanicError(t *testing.T) {
 				t.Error("wrong text msg for panic error")
 			}
 		})
+	}
+}
+
+// Returns a processor instance configured for PreDequeueFunc testing purpose.
+// It uses a short task check interval so that skipped fetch attempts are
+// retried quickly in tests.
+func newPreDequeueProcessorForTest(t *testing.T, r *rdb.RDB, h Handler, fn PreDequeueFunc) *processor {
+	p := newProcessorForTest(t, r, h)
+	p.preDequeueFunc = fn
+	p.taskCheckInterval = 50 * time.Millisecond
+	return p
+}
+
+func TestProcessorPreDequeueAllow(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	m1 := h.NewTaskMessage("task1", nil)
+	m2 := h.NewTaskMessage("task2", nil)
+	h.SeedPendingQueue(t, r, []*base.TaskMessage{m1, m2}, base.DefaultQueueName)
+
+	var mu sync.Mutex
+	var processed []*Task
+	handler := func(ctx context.Context, task *Task) error {
+		mu.Lock()
+		defer mu.Unlock()
+		processed = append(processed, task)
+		return nil
+	}
+	var calls atomic.Int32
+	p := newPreDequeueProcessorForTest(t, rdbClient, HandlerFunc(handler),
+		func(ctx context.Context, queues []string) bool {
+			calls.Add(1)
+			return true
+		})
+
+	p.start(&sync.WaitGroup{})
+	time.Sleep(1 * time.Second) // wait for tasks to be processed
+	if l := r.LLen(context.Background(), base.ActiveKey(base.DefaultQueueName)).Val(); l != 0 {
+		t.Errorf("%q has %d tasks, want 0", base.ActiveKey(base.DefaultQueueName), l)
+	}
+	p.shutdown()
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []*Task{
+		NewTask(m1.Type, m1.Payload),
+		NewTask(m2.Type, m2.Payload),
+	}
+	if diff := cmp.Diff(want, processed, taskCmpOpts...); diff != "" {
+		t.Errorf("mismatch found in processed tasks; (-want, +got)\n%s", diff)
+	}
+	if calls.Load() == 0 {
+		t.Error("PreDequeueFunc was not called")
+	}
+}
+
+func TestProcessorPreDequeueDeny(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	m1 := h.NewTaskMessage("task1", nil)
+	m2 := h.NewTaskMessage("task2", nil)
+	h.SeedPendingQueue(t, r, []*base.TaskMessage{m1, m2}, base.DefaultQueueName)
+
+	var processed atomic.Int32
+	handler := func(ctx context.Context, task *Task) error {
+		processed.Add(1)
+		return nil
+	}
+	p := newPreDequeueProcessorForTest(t, rdbClient, HandlerFunc(handler),
+		func(ctx context.Context, queues []string) bool {
+			return false
+		})
+
+	p.start(&sync.WaitGroup{})
+	// Wait long enough for several fetch attempts to be skipped.
+	time.Sleep(500 * time.Millisecond)
+	p.shutdown()
+
+	if n := processed.Load(); n != 0 {
+		t.Errorf("handler was called %d times, want 0", n)
+	}
+	// Tasks must remain in the pending state, untouched.
+	if got := len(h.GetPendingMessages(t, r, base.DefaultQueueName)); got != 2 {
+		t.Errorf("pending queue has %d messages, want 2", got)
+	}
+	if l := r.LLen(context.Background(), base.ActiveKey(base.DefaultQueueName)).Val(); l != 0 {
+		t.Errorf("%q has %d tasks, want 0", base.ActiveKey(base.DefaultQueueName), l)
+	}
+}
+
+func TestProcessorPreDequeueDenyThenAllow(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	m1 := h.NewTaskMessage("task1", nil)
+	h.SeedPendingQueue(t, r, []*base.TaskMessage{m1}, base.DefaultQueueName)
+
+	processed := make(chan *Task, 1)
+	handler := func(ctx context.Context, task *Task) error {
+		processed <- task
+		return nil
+	}
+	const denyCalls = 3
+	var calls atomic.Int32
+	p := newPreDequeueProcessorForTest(t, rdbClient, HandlerFunc(handler),
+		func(ctx context.Context, queues []string) bool {
+			// Deny the first denyCalls attempts, allow afterwards.
+			return calls.Add(1) > denyCalls
+		})
+
+	p.start(&sync.WaitGroup{})
+	defer p.shutdown()
+
+	select {
+	case <-processed:
+		// Task was processed after PreDequeueFunc started returning true.
+	case <-time.After(3 * time.Second):
+		t.Fatal("task was not processed after PreDequeueFunc started returning true")
+	}
+	if got := calls.Load(); got <= denyCalls {
+		t.Errorf("PreDequeueFunc was called %d times, want more than %d", got, denyCalls)
+	}
+}
+
+func TestProcessorPreDequeueQueuesArg(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	tests := []struct {
+		strict    bool
+		wantOrder []string // expected order in strict mode
+	}{
+		{strict: false},
+		{strict: true, wantOrder: []string{"critical", "default", "low"}},
+	}
+	for _, tc := range tests {
+		h.FlushDB(t, r)
+
+		var mu sync.Mutex
+		var samples [][]string
+		p := newPreDequeueProcessorForTest(t, rdbClient,
+			HandlerFunc(func(ctx context.Context, task *Task) error { return nil }),
+			func(ctx context.Context, queues []string) bool {
+				// Record the queues argument and deny, to keep the
+				// processor calling PreDequeueFunc.
+				mu.Lock()
+				samples = append(samples, queues)
+				mu.Unlock()
+				return false
+			})
+		p.queueConfig = map[string]int{
+			"critical": 6,
+			"default":  3,
+			"low":      1,
+		}
+		if tc.strict {
+			p.orderedQueues = []string{"critical", "default", "low"}
+		}
+
+		p.start(&sync.WaitGroup{})
+		time.Sleep(300 * time.Millisecond) // collect samples
+		p.shutdown()
+
+		mu.Lock()
+		if len(samples) == 0 {
+			mu.Unlock()
+			t.Fatalf("PreDequeueFunc was not called (strict=%v)", tc.strict)
+		}
+		for i, got := range samples {
+			if tc.strict {
+				if diff := cmp.Diff(tc.wantOrder, got); diff != "" {
+					t.Errorf("strict mode, sample %d: mismatch in queues argument; (-want, +got)\n%s", i, diff)
+				}
+				continue
+			}
+			// In non-strict mode the order is randomized; the argument must
+			// contain all configured queues.
+			want := map[string]bool{"critical": true, "default": true, "low": true}
+			if len(got) != len(want) {
+				t.Errorf("non-strict mode, sample %d: got %d queues %v, want %d", i, len(got), got, len(want))
+				continue
+			}
+			for _, q := range got {
+				if !want[q] {
+					t.Errorf("non-strict mode, sample %d: unexpected queue %q in argument", i, q)
+				}
+			}
+		}
+		mu.Unlock()
+	}
+}
+
+func TestProcessorPreDequeuePanic(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	m1 := h.NewTaskMessage("task1", nil)
+	h.SeedPendingQueue(t, r, []*base.TaskMessage{m1}, base.DefaultQueueName)
+
+	processed := make(chan *Task, 1)
+	handler := func(ctx context.Context, task *Task) error {
+		processed <- task
+		return nil
+	}
+	var calls atomic.Int32
+	p := newPreDequeueProcessorForTest(t, rdbClient, HandlerFunc(handler),
+		func(ctx context.Context, queues []string) bool {
+			if calls.Add(1) <= 2 {
+				panic("something went terribly wrong in PreDequeueFunc")
+			}
+			return true
+		})
+
+	p.start(&sync.WaitGroup{})
+	defer p.shutdown()
+
+	// A panic in PreDequeueFunc must not kill the processor goroutine;
+	// the task should still be processed once the function stops panicking.
+	select {
+	case <-processed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("processor did not recover from a panic in PreDequeueFunc")
+	}
+}
+
+func TestProcessorPreDequeueBlockingFuncShutdown(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	rdbClient := rdb.NewRDB(r)
+
+	p := newPreDequeueProcessorForTest(t, rdbClient,
+		HandlerFunc(func(ctx context.Context, task *Task) error { return nil }),
+		func(ctx context.Context, queues []string) bool {
+			// Block until the context is canceled (i.e. the processor stops).
+			<-ctx.Done()
+			return false
+		})
+
+	p.start(&sync.WaitGroup{})
+	time.Sleep(100 * time.Millisecond) // let the processor enter the blocking function
+
+	done := make(chan struct{})
+	go func() {
+		p.shutdown()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown is blocked by a blocking PreDequeueFunc")
 	}
 }
